@@ -1,16 +1,17 @@
-# Doom-style ASCII raycaster in PowerShell.
+# Doom-style ASCII raycaster with enemies in PowerShell.
 # Controls:
 #   W/S: move forward/backward
-#   A/D: rotate left/right
+#   A/D: turn left/right
+#   Space: shoot
 #   Q: quit
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$mapWidth = 16
-$mapHeight = 16
+$MapWidth = 16
+$MapHeight = 16
 
-$worldMap = @(
+$WorldMap = @(
     '################',
     '#..............#',
     '#.......########',
@@ -29,20 +30,12 @@ $worldMap = @(
     '################'
 )
 
-function Get-MapCell {
-    param(
-        [double]$X,
-        [double]$Y
-    )
+function Normalize-Angle {
+    param([double]$Angle)
 
-    $tx = [int][Math]::Floor($X)
-    $ty = [int][Math]::Floor($Y)
-
-    if ($tx -lt 0 -or $tx -ge $mapWidth -or $ty -lt 0 -or $ty -ge $mapHeight) {
-        return '#'
-    }
-
-    return $worldMap[$ty][$tx]
+    while ($Angle -lt -[Math]::PI) { $Angle += (2.0 * [Math]::PI) }
+    while ($Angle -gt [Math]::PI) { $Angle -= (2.0 * [Math]::PI) }
+    return $Angle
 }
 
 function Clamp {
@@ -57,38 +50,180 @@ function Clamp {
     return $Value
 }
 
-function Start-DoomAscii {
+function Get-MapCell {
+    param(
+        [double]$X,
+        [double]$Y
+    )
+
+    $tx = [int][Math]::Floor($X)
+    $ty = [int][Math]::Floor($Y)
+
+    if ($tx -lt 0 -or $tx -ge $MapWidth -or $ty -lt 0 -or $ty -ge $MapHeight) {
+        return '#'
+    }
+
+    return $WorldMap[$ty][$tx]
+}
+
+function Test-Walkable {
+    param(
+        [double]$X,
+        [double]$Y
+    )
+
+    return (Get-MapCell -X $X -Y $Y) -ne '#'
+}
+
+function Get-Distance {
+    param(
+        [double]$X1,
+        [double]$Y1,
+        [double]$X2,
+        [double]$Y2
+    )
+
+    $dx = $X2 - $X1
+    $dy = $Y2 - $Y1
+    return [Math]::Sqrt(($dx * $dx) + ($dy * $dy))
+}
+
+function Get-RayDistance {
+    param(
+        [double]$OriginX,
+        [double]$OriginY,
+        [double]$Angle,
+        [double]$MaxDepth
+    )
+
+    $stepSize = 0.05
+    $distance = 0.0
+
+    while ($distance -lt $MaxDepth) {
+        $distance += $stepSize
+        $testX = $OriginX + ([Math]::Sin($Angle) * $distance)
+        $testY = $OriginY + ([Math]::Cos($Angle) * $distance)
+
+        if ((Get-MapCell -X $testX -Y $testY) -eq '#') {
+            return $distance
+        }
+    }
+
+    return $MaxDepth
+}
+
+function Test-LineOfSight {
+    param(
+        [double]$FromX,
+        [double]$FromY,
+        [double]$ToX,
+        [double]$ToY
+    )
+
+    $dx = $ToX - $FromX
+    $dy = $ToY - $FromY
+    $dist = [Math]::Sqrt(($dx * $dx) + ($dy * $dy))
+    if ($dist -le 0.001) { return $true }
+
+    $angle = [Math]::Atan2($dx, $dy)
+    $hitDist = Get-RayDistance -OriginX $FromX -OriginY $FromY -Angle $angle -MaxDepth $dist
+    return $hitDist -ge ($dist - 0.1)
+}
+
+function New-Enemy {
+    param(
+        [double]$PlayerX,
+        [double]$PlayerY
+    )
+
+    for ($i = 0; $i -lt 300; $i++) {
+        $x = (Get-Random -Minimum 1 -Maximum ($MapWidth - 1)) + 0.5
+        $y = (Get-Random -Minimum 1 -Maximum ($MapHeight - 1)) + 0.5
+
+        if ((Get-MapCell -X $x -Y $y) -eq '#') { continue }
+        if ((Get-Distance -X1 $x -Y1 $y -X2 $PlayerX -Y2 $PlayerY) -lt 4.0) { continue }
+
+        return [pscustomobject]@{
+            X = [double]$x
+            Y = [double]$y
+            Health = 2
+            Alive = $true
+            Cooldown = (Get-Random -Minimum 0.2 -Maximum 1.4)
+        }
+    }
+
+    return $null
+}
+
+function Spawn-Wave {
+    param(
+        [System.Collections.ArrayList]$Enemies,
+        [int]$Wave,
+        [double]$PlayerX,
+        [double]$PlayerY
+    )
+
+    $spawnCount = 2 + $Wave
+    for ($i = 0; $i -lt $spawnCount; $i++) {
+        $enemy = New-Enemy -PlayerX $PlayerX -PlayerY $PlayerY
+        if ($null -ne $enemy) {
+            [void]$Enemies.Add($enemy)
+        }
+    }
+}
+
+function Start-DoomLike {
     $playerX = 8.0
     $playerY = 8.0
     $playerA = 0.0
 
+    $health = 100
+    $kills = 0
+    $wave = 0
+
     $fov = [Math]::PI / 4.0
-    $depth = 16.0
+    $depth = 18.0
 
-    $moveSpeed = 5.0
-    $turnSpeed = 2.2
+    $moveSpeed = 4.8
+    $turnSpeed = 2.6
 
-    $screenWidth = [Math]::Min(120, [Math]::Max(80, [Console]::WindowWidth - 1))
-    $screenHeight = [Math]::Min(40, [Math]::Max(26, [Console]::WindowHeight - 1))
+    $availableWidth = [Console]::WindowWidth
+    $availableHeight = [Console]::WindowHeight
+    if ($availableWidth -le 0) { $availableWidth = 100 }
+    if ($availableHeight -le 0) { $availableHeight = 35 }
 
-    if ([Console]::BufferWidth -lt $screenWidth -or [Console]::BufferHeight -lt $screenHeight) {
-        throw "Console buffer is too small. Increase terminal size and retry."
-    }
+    $screenWidth = [int][Math]::Min(120, [Math]::Max(80, $availableWidth - 1))
+    $screenHeight = [int][Math]::Min(42, [Math]::Max(28, $availableHeight - 1))
+
+    $enemies = [System.Collections.ArrayList]::new()
+    $enemyBullets = [System.Collections.ArrayList]::new()
+
+    $weaponCooldown = 0.0
+    $message = ''
+    $messageTimer = 0.0
+
+    Spawn-Wave -Enemies $enemies -Wave $wave -PlayerX $playerX -PlayerY $playerY
 
     $origCursorVisible = [Console]::CursorVisible
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    $last = $stopwatch.Elapsed.TotalSeconds
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $last = $sw.Elapsed.TotalSeconds
 
     try {
         [Console]::CursorVisible = $false
         Clear-Host
 
         while ($true) {
-            $now = $stopwatch.Elapsed.TotalSeconds
+            $now = $sw.Elapsed.TotalSeconds
             $dt = $now - $last
             $last = $now
-            if ($dt -le 0) {
-                $dt = 0.016
+
+            if ($dt -le 0) { $dt = 0.016 }
+            if ($dt -gt 0.05) { $dt = 0.05 }
+
+            if ($weaponCooldown -gt 0) { $weaponCooldown -= $dt }
+            if ($messageTimer -gt 0) {
+                $messageTimer -= $dt
+                if ($messageTimer -le 0) { $message = '' }
             }
 
             while ([Console]::KeyAvailable) {
@@ -98,132 +233,301 @@ function Start-DoomAscii {
                     'A' { $playerA -= $turnSpeed * $dt }
                     'D' { $playerA += $turnSpeed * $dt }
                     'W' {
-                        $newX = $playerX + [Math]::Sin($playerA) * $moveSpeed * $dt
-                        $newY = $playerY + [Math]::Cos($playerA) * $moveSpeed * $dt
-                        if ((Get-MapCell -X $newX -Y $newY) -ne '#') {
+                        $newX = $playerX + ([Math]::Sin($playerA) * $moveSpeed * $dt)
+                        $newY = $playerY + ([Math]::Cos($playerA) * $moveSpeed * $dt)
+                        if (Test-Walkable -X $newX -Y $newY) {
                             $playerX = $newX
                             $playerY = $newY
                         }
                     }
                     'S' {
-                        $newX = $playerX - [Math]::Sin($playerA) * $moveSpeed * $dt
-                        $newY = $playerY - [Math]::Cos($playerA) * $moveSpeed * $dt
-                        if ((Get-MapCell -X $newX -Y $newY) -ne '#') {
+                        $newX = $playerX - ([Math]::Sin($playerA) * $moveSpeed * $dt)
+                        $newY = $playerY - ([Math]::Cos($playerA) * $moveSpeed * $dt)
+                        if (Test-Walkable -X $newX -Y $newY) {
                             $playerX = $newX
                             $playerY = $newY
+                        }
+                    }
+                    'Spacebar' {
+                        if ($weaponCooldown -le 0) {
+                            $weaponCooldown = 0.25
+
+                            $wallDist = Get-RayDistance -OriginX $playerX -OriginY $playerY -Angle $playerA -MaxDepth $depth
+                            $bestDist = $depth
+                            $hitEnemy = $null
+
+                            foreach ($enemy in $enemies) {
+                                if (-not $enemy.Alive) { continue }
+
+                                $dx = $enemy.X - $playerX
+                                $dy = $enemy.Y - $playerY
+                                $dist = [Math]::Sqrt(($dx * $dx) + ($dy * $dy))
+                                if ($dist -gt $depth) { continue }
+
+                                $angleToEnemy = Normalize-Angle ([Math]::Atan2($dx, $dy) - $playerA)
+                                if ([Math]::Abs($angleToEnemy) -gt 0.07) { continue }
+
+                                if ($dist -lt $bestDist -and $dist -lt $wallDist -and (Test-LineOfSight -FromX $playerX -FromY $playerY -ToX $enemy.X -ToY $enemy.Y)) {
+                                    $bestDist = $dist
+                                    $hitEnemy = $enemy
+                                }
+                            }
+
+                            if ($null -ne $hitEnemy) {
+                                $hitEnemy.Health -= 1
+                                if ($hitEnemy.Health -le 0) {
+                                    $hitEnemy.Alive = $false
+                                    $kills++
+                                    $message = 'Enemy down!'
+                                    $messageTimer = 1.0
+                                } else {
+                                    $message = 'Hit!'
+                                    $messageTimer = 0.7
+                                }
+                            } else {
+                                $message = 'Miss'
+                                $messageTimer = 0.4
+                            }
                         }
                     }
                 }
             }
 
-            $frame = New-Object 'char[,]' $screenHeight, $screenWidth
+            $aliveCount = 0
+            foreach ($enemy in $enemies) {
+                if ($enemy.Alive) { $aliveCount++ }
+            }
+
+            if ($aliveCount -eq 0) {
+                $wave++
+                Spawn-Wave -Enemies $enemies -Wave $wave -PlayerX $playerX -PlayerY $playerY
+                $message = "Wave $wave"
+                $messageTimer = 1.5
+            }
+
+            foreach ($enemy in $enemies) {
+                if (-not $enemy.Alive) { continue }
+
+                $enemy.Cooldown -= $dt
+
+                $dx = $playerX - $enemy.X
+                $dy = $playerY - $enemy.Y
+                $distToPlayer = [Math]::Sqrt(($dx * $dx) + ($dy * $dy))
+
+                if ($distToPlayer -lt 0.65) {
+                    $health -= [int](18.0 * $dt)
+                }
+
+                $hasSight = Test-LineOfSight -FromX $enemy.X -FromY $enemy.Y -ToX $playerX -ToY $playerY
+
+                if ($hasSight -and $distToPlayer -gt 1.2 -and $distToPlayer -lt 11.0) {
+                    $ang = [Math]::Atan2($dx, $dy)
+                    $step = 1.4 * $dt
+                    $newEX = $enemy.X + ([Math]::Sin($ang) * $step)
+                    $newEY = $enemy.Y + ([Math]::Cos($ang) * $step)
+                    if (Test-Walkable -X $newEX -Y $newEY) {
+                        $enemy.X = $newEX
+                        $enemy.Y = $newEY
+                    }
+                }
+
+                if ($hasSight -and $distToPlayer -lt 12.0 -and $enemy.Cooldown -le 0) {
+                    $enemy.Cooldown = (Get-Random -Minimum 1.0 -Maximum 2.0)
+                    $bang = [Math]::Atan2(($playerX - $enemy.X), ($playerY - $enemy.Y))
+                    $bvX = [Math]::Sin($bang) * 8.0
+                    $bvY = [Math]::Cos($bang) * 8.0
+                    [void]$enemyBullets.Add([pscustomobject]@{
+                        X = [double]$enemy.X
+                        Y = [double]$enemy.Y
+                        VX = [double]$bvX
+                        VY = [double]$bvY
+                        Life = 2.0
+                    })
+                }
+            }
+
+            for ($i = $enemyBullets.Count - 1; $i -ge 0; $i--) {
+                $b = $enemyBullets[$i]
+                $b.Life -= $dt
+                if ($b.Life -le 0) {
+                    $enemyBullets.RemoveAt($i)
+                    continue
+                }
+
+                $b.X += ($b.VX * $dt)
+                $b.Y += ($b.VY * $dt)
+
+                if ((Get-MapCell -X $b.X -Y $b.Y) -eq '#') {
+                    $enemyBullets.RemoveAt($i)
+                    continue
+                }
+
+                if ((Get-Distance -X1 $b.X -Y1 $b.Y -X2 $playerX -Y2 $playerY) -lt 0.35) {
+                    $health -= 14
+                    $enemyBullets.RemoveAt($i)
+                    $message = 'You were hit!'
+                    $messageTimer = 0.8
+                    continue
+                }
+            }
+
+            if ($health -le 0) { break }
+
+            $frame = [char[,]]::new($screenHeight, $screenWidth)
+            $depthBuffer = [double[]]::new($screenWidth)
 
             for ($x = 0; $x -lt $screenWidth; $x++) {
-                $rayAngle = ($playerA - $fov / 2.0) + ($x / [double]$screenWidth) * $fov
+                $rayAngle = ($playerA - ($fov / 2.0)) + (($x / [double]$screenWidth) * $fov)
                 $eyeX = [Math]::Sin($rayAngle)
                 $eyeY = [Math]::Cos($rayAngle)
 
                 $distanceToWall = 0.0
                 $hitWall = $false
-                $boundary = $false
 
                 while (-not $hitWall -and $distanceToWall -lt $depth) {
-                    $distanceToWall += 0.08
-                    $testX = [int][Math]::Floor($playerX + $eyeX * $distanceToWall)
-                    $testY = [int][Math]::Floor($playerY + $eyeY * $distanceToWall)
+                    $distanceToWall += 0.05
+                    $testX = [int][Math]::Floor($playerX + ($eyeX * $distanceToWall))
+                    $testY = [int][Math]::Floor($playerY + ($eyeY * $distanceToWall))
 
-                    if ($testX -lt 0 -or $testX -ge $mapWidth -or $testY -lt 0 -or $testY -ge $mapHeight) {
+                    if ($testX -lt 0 -or $testX -ge $MapWidth -or $testY -lt 0 -or $testY -ge $MapHeight) {
                         $hitWall = $true
                         $distanceToWall = $depth
-                    }
-                    elseif ($worldMap[$testY][$testX] -eq '#') {
+                    } elseif ($WorldMap[$testY][$testX] -eq '#') {
                         $hitWall = $true
-
-                        $corners = @()
-                        for ($tx = 0; $tx -le 1; $tx++) {
-                            for ($ty = 0; $ty -le 1; $ty++) {
-                                $vy = ($testY + $ty) - $playerY
-                                $vx = ($testX + $tx) - $playerX
-                                $d = [Math]::Sqrt($vx * $vx + $vy * $vy)
-                                if ($d -eq 0) { continue }
-                                $dot = ($eyeX * $vx / $d) + ($eyeY * $vy / $d)
-                                $corners += [pscustomobject]@{ Dist = $d; Dot = $dot }
-                            }
-                        }
-
-                        $corners = $corners | Sort-Object Dist
-                        if ($corners.Count -ge 2) {
-                            $bound = 0.01
-                            if ([Math]::Acos($corners[0].Dot) -lt $bound -or [Math]::Acos($corners[1].Dot) -lt $bound) {
-                                $boundary = $true
-                            }
-                        }
                     }
                 }
 
-                $distanceToWall = Clamp -Value $distanceToWall -Min 0.1 -Max $depth
-                $ceiling = [int]([double]($screenHeight / 2.0) - $screenHeight / $distanceToWall)
+                $depthBuffer[$x] = $distanceToWall
+
+                $ceiling = [int](($screenHeight / 2.0) - ($screenHeight / $distanceToWall))
                 $floor = $screenHeight - $ceiling
+
                 $ceiling = [int](Clamp -Value $ceiling -Min 0 -Max ($screenHeight - 1))
                 $floor = [int](Clamp -Value $floor -Min 0 -Max ($screenHeight - 1))
 
                 $wallShade = ' '
-                if ($boundary) {
-                    $wallShade = '|'
-                }
-                elseif ($distanceToWall -le ($depth / 4.0)) {
-                    $wallShade = [char]0x2588
-                }
-                elseif ($distanceToWall -lt ($depth / 3.0)) {
-                    $wallShade = [char]0x2593
-                }
-                elseif ($distanceToWall -lt ($depth / 2.0)) {
-                    $wallShade = [char]0x2592
-                }
-                elseif ($distanceToWall -lt $depth) {
-                    $wallShade = [char]0x2591
-                }
+                if ($distanceToWall -lt ($depth * 0.20)) { $wallShade = '@' }
+                elseif ($distanceToWall -lt ($depth * 0.35)) { $wallShade = '#' }
+                elseif ($distanceToWall -lt ($depth * 0.50)) { $wallShade = 'X' }
+                elseif ($distanceToWall -lt ($depth * 0.70)) { $wallShade = 'x' }
+                elseif ($distanceToWall -lt $depth) { $wallShade = '.' }
 
                 for ($y = 0; $y -lt $screenHeight; $y++) {
                     if ($y -lt $ceiling) {
                         $frame[$y, $x] = ' '
-                    }
-                    elseif ($y -gt $ceiling -and $y -le $floor) {
+                    } elseif ($y -le $floor) {
                         $frame[$y, $x] = $wallShade
-                    }
-                    else {
-                        $b = 1.0 - (($y - $screenHeight / 2.0) / ($screenHeight / 2.0))
+                    } else {
+                        $b = 1.0 - (($y - ($screenHeight / 2.0)) / ($screenHeight / 2.0))
                         if ($b -lt 0.25) { $frame[$y, $x] = '#' }
                         elseif ($b -lt 0.5) { $frame[$y, $x] = 'x' }
                         elseif ($b -lt 0.75) { $frame[$y, $x] = '.' }
-                        elseif ($b -lt 0.9) { $frame[$y, $x] = '-' }
                         else { $frame[$y, $x] = ' ' }
                     }
                 }
             }
 
-            for ($ix = 0; $ix -lt $mapWidth; $ix++) {
-                for ($iy = 0; $iy -lt $mapHeight; $iy++) {
-                    $row = [int]($iy + 1)
-                    $col = [int]$ix
-                    if ($row -lt $screenHeight -and $col -lt $screenWidth) {
-                        $frame[$row, $col] = $worldMap[$iy].Substring($ix, 1)
+            foreach ($enemy in $enemies) {
+                if (-not $enemy.Alive) { continue }
+
+                $dx = $enemy.X - $playerX
+                $dy = $enemy.Y - $playerY
+                $dist = [Math]::Sqrt(($dx * $dx) + ($dy * $dy))
+                if ($dist -le 0.25 -or $dist -gt $depth) { continue }
+
+                $angle = Normalize-Angle ([Math]::Atan2($dx, $dy) - $playerA)
+                if ([Math]::Abs($angle) -gt ($fov / 2.0)) { continue }
+
+                $screenX = [int]((($angle + ($fov / 2.0)) / $fov) * $screenWidth)
+                $enemyHeight = [int]($screenHeight / $dist)
+                $enemyHeight = [int](Clamp -Value $enemyHeight -Min 1 -Max $screenHeight)
+
+                $top = [int](($screenHeight / 2) - ($enemyHeight / 2))
+                $bottom = [int](($screenHeight / 2) + ($enemyHeight / 2))
+                $top = [int](Clamp -Value $top -Min 0 -Max ($screenHeight - 1))
+                $bottom = [int](Clamp -Value $bottom -Min 0 -Max ($screenHeight - 1))
+
+                $halfWidth = [int][Math]::Max(1, [Math]::Floor($enemyHeight / 4))
+                $spriteChar = if ($enemy.Health -eq 1) { 'w' } else { 'M' }
+
+                for ($sx = -$halfWidth; $sx -le $halfWidth; $sx++) {
+                    $col = $screenX + $sx
+                    if ($col -lt 0 -or $col -ge $screenWidth) { continue }
+                    if ($dist -ge $depthBuffer[$col]) { continue }
+
+                    for ($yy = $top; $yy -le $bottom; $yy++) {
+                        $frame[$yy, $col] = $spriteChar
                     }
                 }
             }
 
-            $px = [int][Math]::Floor($playerX)
-            $py = [int][Math]::Floor($playerY)
-            if ($py + 1 -lt $screenHeight -and $px -lt $screenWidth) {
-                $frame[($py + 1), $px] = 'P'
+            foreach ($b in $enemyBullets) {
+                $dx = $b.X - $playerX
+                $dy = $b.Y - $playerY
+                $dist = [Math]::Sqrt(($dx * $dx) + ($dy * $dy))
+                if ($dist -le 0.1 -or $dist -gt $depth) { continue }
+
+                $angle = Normalize-Angle ([Math]::Atan2($dx, $dy) - $playerA)
+                if ([Math]::Abs($angle) -gt ($fov / 2.0)) { continue }
+
+                $col = [int]((($angle + ($fov / 2.0)) / $fov) * $screenWidth)
+                if ($col -lt 0 -or $col -ge $screenWidth) { continue }
+                if ($dist -ge $depthBuffer[$col]) { continue }
+
+                $h = [int](($screenHeight / 2.0) - ($screenHeight / $dist))
+                $h = [int](Clamp -Value $h -Min 1 -Max ($screenHeight - 2))
+                $frame[$h, $col] = '*'
             }
 
-            $stat = "DOOM PS  FPS: {0,5:N1}  X:{1,5:N2} Y:{2,5:N2} A:{3,5:N2}  (W/S move, A/D turn, Q quit)" -f (1.0 / $dt), $playerX, $playerY, $playerA
-            for ($i = 0; $i -lt [Math]::Min($stat.Length, $screenWidth); $i++) {
-                $frame[0, $i] = $stat[$i]
+            for ($ix = 0; $ix -lt $MapWidth; $ix++) {
+                for ($iy = 0; $iy -lt $MapHeight; $iy++) {
+                    $row = [int]($iy + 1)
+                    $col = [int]$ix
+                    if ($row -lt $screenHeight -and $col -lt $screenWidth) {
+                        $frame[$row, $col] = $WorldMap[$iy].Substring($ix, 1)
+                    }
+                }
             }
 
-            $builder = New-Object System.Text.StringBuilder
+            foreach ($enemy in $enemies) {
+                if (-not $enemy.Alive) { continue }
+                $mx = [int][Math]::Floor($enemy.X)
+                $my = [int][Math]::Floor($enemy.Y)
+                $row = [int]($my + 1)
+                if ($mx -ge 0 -and $mx -lt $MapWidth -and $row -ge 1 -and $row -lt $screenHeight) {
+                    $frame[$row, $mx] = 'E'
+                }
+            }
+
+            $pMapX = [int][Math]::Floor($playerX)
+            $pMapY = [int][Math]::Floor($playerY)
+            $pRow = [int]($pMapY + 1)
+            if ($pMapX -ge 0 -and $pMapX -lt $MapWidth -and $pRow -ge 1 -and $pRow -lt $screenHeight) {
+                $frame[$pRow, $pMapX] = 'P'
+            }
+
+            $crossX = [int]($screenWidth / 2)
+            $crossY = [int]($screenHeight / 2)
+            if ($crossX -ge 0 -and $crossX -lt $screenWidth -and $crossY -ge 0 -and $crossY -lt $screenHeight) {
+                $frame[$crossY, $crossX] = '+'
+            }
+
+            $aliveNow = 0
+            foreach ($enemy in $enemies) {
+                if ($enemy.Alive) { $aliveNow++ }
+            }
+
+            $hud = "DOOM-LIKE  HP:{0,3}  Kills:{1,3}  Wave:{2,2}  Enemies:{3,2}  FPS:{4,5:N1}  W/S move A/D turn Space fire Q quit" -f $health, $kills, $wave, $aliveNow, (1.0 / $dt)
+            if ($message.Length -gt 0) {
+                $hud += "  [$message]"
+            }
+
+            $hudLen = [Math]::Min($hud.Length, $screenWidth)
+            for ($i = 0; $i -lt $hudLen; $i++) {
+                $frame[0, $i] = $hud[$i]
+            }
+
+            $builder = [System.Text.StringBuilder]::new()
             for ($y = 0; $y -lt $screenHeight; $y++) {
                 for ($x = 0; $x -lt $screenWidth; $x++) {
                     [void]$builder.Append($frame[$y, $x])
@@ -236,12 +540,16 @@ function Start-DoomAscii {
             [Console]::SetCursorPosition(0, 0)
             [Console]::Write($builder.ToString())
         }
+
+        Clear-Host
+        Write-Host 'GAME OVER' -ForegroundColor Red
+        Write-Host ("Kills: {0}   Waves cleared: {1}" -f $kills, $wave)
     }
     finally {
         [Console]::CursorVisible = $origCursorVisible
         [Console]::WriteLine('')
-        [Console]::WriteLine('Exited DOOM PS.')
+        [Console]::WriteLine('Exited Doom-Like PS.')
     }
 }
 
-Start-DoomAscii
+Start-DoomLike
