@@ -1,0 +1,247 @@
+# Doom-style ASCII raycaster in PowerShell.
+# Controls:
+#   W/S: move forward/backward
+#   A/D: rotate left/right
+#   Q: quit
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$mapWidth = 16
+$mapHeight = 16
+
+$worldMap = @(
+    '################',
+    '#..............#',
+    '#.......########',
+    '#..............#',
+    '#......##......#',
+    '#......##......#',
+    '#..............#',
+    '###............#',
+    '##.............#',
+    '#......####..###',
+    '#......#.......#',
+    '#......#.......#',
+    '#..............#',
+    '#......#########',
+    '#..............#',
+    '################'
+)
+
+function Get-MapCell {
+    param(
+        [double]$X,
+        [double]$Y
+    )
+
+    $tx = [int][Math]::Floor($X)
+    $ty = [int][Math]::Floor($Y)
+
+    if ($tx -lt 0 -or $tx -ge $mapWidth -or $ty -lt 0 -or $ty -ge $mapHeight) {
+        return '#'
+    }
+
+    return $worldMap[$ty][$tx]
+}
+
+function Clamp {
+    param(
+        [double]$Value,
+        [double]$Min,
+        [double]$Max
+    )
+
+    if ($Value -lt $Min) { return $Min }
+    if ($Value -gt $Max) { return $Max }
+    return $Value
+}
+
+function Start-DoomAscii {
+    $playerX = 8.0
+    $playerY = 8.0
+    $playerA = 0.0
+
+    $fov = [Math]::PI / 4.0
+    $depth = 16.0
+
+    $moveSpeed = 5.0
+    $turnSpeed = 2.2
+
+    $screenWidth = [Math]::Min(120, [Math]::Max(80, [Console]::WindowWidth - 1))
+    $screenHeight = [Math]::Min(40, [Math]::Max(26, [Console]::WindowHeight - 1))
+
+    if ([Console]::BufferWidth -lt $screenWidth -or [Console]::BufferHeight -lt $screenHeight) {
+        throw "Console buffer is too small. Increase terminal size and retry."
+    }
+
+    $origCursorVisible = [Console]::CursorVisible
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $last = $stopwatch.Elapsed.TotalSeconds
+
+    try {
+        [Console]::CursorVisible = $false
+        Clear-Host
+
+        while ($true) {
+            $now = $stopwatch.Elapsed.TotalSeconds
+            $dt = $now - $last
+            $last = $now
+            if ($dt -le 0) {
+                $dt = 0.016
+            }
+
+            while ([Console]::KeyAvailable) {
+                $key = [Console]::ReadKey($true)
+                switch ($key.Key) {
+                    'Q' { return }
+                    'A' { $playerA -= $turnSpeed * $dt }
+                    'D' { $playerA += $turnSpeed * $dt }
+                    'W' {
+                        $newX = $playerX + [Math]::Sin($playerA) * $moveSpeed * $dt
+                        $newY = $playerY + [Math]::Cos($playerA) * $moveSpeed * $dt
+                        if ((Get-MapCell -X $newX -Y $newY) -ne '#') {
+                            $playerX = $newX
+                            $playerY = $newY
+                        }
+                    }
+                    'S' {
+                        $newX = $playerX - [Math]::Sin($playerA) * $moveSpeed * $dt
+                        $newY = $playerY - [Math]::Cos($playerA) * $moveSpeed * $dt
+                        if ((Get-MapCell -X $newX -Y $newY) -ne '#') {
+                            $playerX = $newX
+                            $playerY = $newY
+                        }
+                    }
+                }
+            }
+
+            $frame = New-Object 'char[,]' $screenHeight, $screenWidth
+
+            for ($x = 0; $x -lt $screenWidth; $x++) {
+                $rayAngle = ($playerA - $fov / 2.0) + ($x / [double]$screenWidth) * $fov
+                $eyeX = [Math]::Sin($rayAngle)
+                $eyeY = [Math]::Cos($rayAngle)
+
+                $distanceToWall = 0.0
+                $hitWall = $false
+                $boundary = $false
+
+                while (-not $hitWall -and $distanceToWall -lt $depth) {
+                    $distanceToWall += 0.08
+                    $testX = [int][Math]::Floor($playerX + $eyeX * $distanceToWall)
+                    $testY = [int][Math]::Floor($playerY + $eyeY * $distanceToWall)
+
+                    if ($testX -lt 0 -or $testX -ge $mapWidth -or $testY -lt 0 -or $testY -ge $mapHeight) {
+                        $hitWall = $true
+                        $distanceToWall = $depth
+                    }
+                    elseif ($worldMap[$testY][$testX] -eq '#') {
+                        $hitWall = $true
+
+                        $corners = @()
+                        for ($tx = 0; $tx -le 1; $tx++) {
+                            for ($ty = 0; $ty -le 1; $ty++) {
+                                $vy = ($testY + $ty) - $playerY
+                                $vx = ($testX + $tx) - $playerX
+                                $d = [Math]::Sqrt($vx * $vx + $vy * $vy)
+                                if ($d -eq 0) { continue }
+                                $dot = ($eyeX * $vx / $d) + ($eyeY * $vy / $d)
+                                $corners += [pscustomobject]@{ Dist = $d; Dot = $dot }
+                            }
+                        }
+
+                        $corners = $corners | Sort-Object Dist
+                        if ($corners.Count -ge 2) {
+                            $bound = 0.01
+                            if ([Math]::Acos($corners[0].Dot) -lt $bound -or [Math]::Acos($corners[1].Dot) -lt $bound) {
+                                $boundary = $true
+                            }
+                        }
+                    }
+                }
+
+                $distanceToWall = Clamp -Value $distanceToWall -Min 0.1 -Max $depth
+                $ceiling = [int]([double]($screenHeight / 2.0) - $screenHeight / $distanceToWall)
+                $floor = $screenHeight - $ceiling
+                $ceiling = [int](Clamp -Value $ceiling -Min 0 -Max ($screenHeight - 1))
+                $floor = [int](Clamp -Value $floor -Min 0 -Max ($screenHeight - 1))
+
+                $wallShade = ' '
+                if ($boundary) {
+                    $wallShade = '|'
+                }
+                elseif ($distanceToWall -le ($depth / 4.0)) {
+                    $wallShade = [char]0x2588
+                }
+                elseif ($distanceToWall -lt ($depth / 3.0)) {
+                    $wallShade = [char]0x2593
+                }
+                elseif ($distanceToWall -lt ($depth / 2.0)) {
+                    $wallShade = [char]0x2592
+                }
+                elseif ($distanceToWall -lt $depth) {
+                    $wallShade = [char]0x2591
+                }
+
+                for ($y = 0; $y -lt $screenHeight; $y++) {
+                    if ($y -lt $ceiling) {
+                        $frame[$y, $x] = ' '
+                    }
+                    elseif ($y -gt $ceiling -and $y -le $floor) {
+                        $frame[$y, $x] = $wallShade
+                    }
+                    else {
+                        $b = 1.0 - (($y - $screenHeight / 2.0) / ($screenHeight / 2.0))
+                        if ($b -lt 0.25) { $frame[$y, $x] = '#' }
+                        elseif ($b -lt 0.5) { $frame[$y, $x] = 'x' }
+                        elseif ($b -lt 0.75) { $frame[$y, $x] = '.' }
+                        elseif ($b -lt 0.9) { $frame[$y, $x] = '-' }
+                        else { $frame[$y, $x] = ' ' }
+                    }
+                }
+            }
+
+            for ($ix = 0; $ix -lt $mapWidth; $ix++) {
+                for ($iy = 0; $iy -lt $mapHeight; $iy++) {
+                    $row = [int]($iy + 1)
+                    $col = [int]$ix
+                    if ($row -lt $screenHeight -and $col -lt $screenWidth) {
+                        $frame[$row, $col] = $worldMap[$iy].Substring($ix, 1)
+                    }
+                }
+            }
+
+            $px = [int][Math]::Floor($playerX)
+            $py = [int][Math]::Floor($playerY)
+            if ($py + 1 -lt $screenHeight -and $px -lt $screenWidth) {
+                $frame[($py + 1), $px] = 'P'
+            }
+
+            $stat = "DOOM PS  FPS: {0,5:N1}  X:{1,5:N2} Y:{2,5:N2} A:{3,5:N2}  (W/S move, A/D turn, Q quit)" -f (1.0 / $dt), $playerX, $playerY, $playerA
+            for ($i = 0; $i -lt [Math]::Min($stat.Length, $screenWidth); $i++) {
+                $frame[0, $i] = $stat[$i]
+            }
+
+            $builder = New-Object System.Text.StringBuilder
+            for ($y = 0; $y -lt $screenHeight; $y++) {
+                for ($x = 0; $x -lt $screenWidth; $x++) {
+                    [void]$builder.Append($frame[$y, $x])
+                }
+                if ($y -lt ($screenHeight - 1)) {
+                    [void]$builder.Append([Environment]::NewLine)
+                }
+            }
+
+            [Console]::SetCursorPosition(0, 0)
+            [Console]::Write($builder.ToString())
+        }
+    }
+    finally {
+        [Console]::CursorVisible = $origCursorVisible
+        [Console]::WriteLine('')
+        [Console]::WriteLine('Exited DOOM PS.')
+    }
+}
+
+Start-DoomAscii
